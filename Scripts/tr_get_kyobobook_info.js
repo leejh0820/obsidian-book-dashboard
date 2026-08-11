@@ -1,229 +1,234 @@
-async function get_kyobobook_info(tp, url, status = "읽는 중") {
+// tr_get_kyobobook_info.js  (v2)
+//
+// 상세 페이지 HTML에는 저자가 없다(Next.js 클라이언트 렌더링). meta 태그에 이름이 보이는 건
+// 책 소개문에 우연히 섞인 것일 뿐. 따라서 저자/카테고리/출판사는 검색 자동완성 API에서 가져온다.
+//
+//   1) 상세 HTML  -> og:image 에서 ISBN, og:title 에서 제목, 목차, 출간일
+//   2) 검색 API   -> ISBN 으로 조회 -> TOT_RELATE_HTML_LIST 를 $@ 로 쪼개 저자/카테고리/출판사
+//
+// requestUrl 안 씀. Templater 전역 request() 만 사용.
+
+const DEBUG = true; // 안정화되면 false
+
+function log(...a) {
+  if (DEBUG) console.log("[kyobo]", ...a);
+}
+
+async function fetchText(url, headers) {
+  try {
+    return await request(headers ? { url, headers } : { url });
+  } catch (e) {
+    log("fetch 실패:", url, e && e.message ? e.message : e);
+    return "";
+  }
+}
+
+function parseJsonLoose(txt) {
+  if (!txt) return null;
+  let s = txt.trim();
+  const m = s.match(/^[A-Za-z_$][\w$]*\(([\s\S]*)\)\s*;?$/); // jsonp 껍데기
+  if (m) s = m[1];
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    return null;
+  }
+}
+
+const SUB_ROLE = /번역|옮긴이|역자|감수|그림|만화|각색|엮음|사진|편집|해설|낭독/;
+
+function splitAuthors(raw) {
+  if (!raw) return [];
+  return String(raw)
+    .split(/\s*[,;|·]\s*|\s+외\s*$/)
+    .map((n) => n.replace(/\s*\((지은이|글|그림|저|원작|저자)\)\s*/g, "").trim())
+    .filter((n) => n && n.length >= 2 && n.length <= 40 && !SUB_ROLE.test(n));
+}
+
+// 검색 자동완성 API 조회. ISBN 으로 부르면 결과가 1건으로 떨어져서 가장 정확하다.
+async function lookupBySearchApi(keyword) {
+  if (!keyword) return null;
+  const txt = await fetchText(
+    `https://search.kyobobook.co.kr/srp/api/v1/search/autocomplete/shop?keyword=${encodeURIComponent(keyword)}`
+  );
+  const json = parseJsonLoose(txt);
+  const docs = json?.data?.resultDocuments || json?.resultDocuments || [];
+  log("검색 API 결과:", docs.length, "건 (keyword:", keyword + ")");
+  if (!docs.length) return null;
+
+  const d = docs[0];
+  const out = {
+    isbn: d.CMDTCODE || "",
+    title: d.CMDT_NAME || "",
+    cmdtId: d.SALE_CMDTID || "",
+    category: "",
+    authors: [],
+    publisher: "",
+    year: "",
+    month: "",
+    blurb: "",
+  };
+
+  // "ISBN$@카테고리$@제목$@저자$@출판사$@연$@월$@정가$@..." 형태
+  const f = String(d.TOT_RELATE_HTML_LIST || d.RELATE_HTML_LIST || "").split("$@");
+  if (f.length >= 7 && /^\d{13}$/.test((f[0] || "").trim())) {
+    out.category = (f[1] || "").trim();
+    if (!out.title) out.title = (f[2] || "").trim();
+    out.authors = splitAuthors(f[3]);
+    out.publisher = (f[4] || "").trim();
+    out.year = (f[5] || "").trim();
+    out.month = (f[6] || "").trim();
+    const blurb = (f[21] || "").trim();
+    if (blurb && blurb !== "0") out.blurb = blurb;
+    log("필드 파싱 성공:", out.authors, "/", out.publisher, "/", out.category);
+  } else {
+    log("필드 포맷이 예상과 다름. 앞 8개:", f.slice(0, 8));
+    // 포맷이 바뀐 경우 이름 기반 필드로 재시도
+    out.authors = splitAuthors(d.AUTR_NAME || d.autrName || d.ART_NAME || "");
+    out.publisher = d.PBCM_NAME || d.pbcmName || "";
+  }
+  return out;
+}
+
+async function get_kyobobook_info(tp, url, status = "읽는 중", authorHint = "") {
   if (!url) {
     alert("유효한 도서 URL이 없습니다.");
     return "";
   }
 
-  // 1. URL 정밀 정규화
+  // ---------- 1. URL / 상품코드 정규화 ----------
   let cleanUrl = "";
   if (typeof url === "string") {
-    let matchUrl = url.match(/https?:\/\/product\.kyobobook\.co\.kr\/detail\/[A-Za-z0-9_-]+/i);
-    if (matchUrl) {
-      cleanUrl = matchUrl[0];
-    } else {
-      let matchCode = url.match(/S[0-9]{12}|[0-9]{13}/);
-      if (matchCode) {
-        cleanUrl = `https://product.kyobobook.co.kr/detail/${matchCode[0]}`;
-      } else {
-        cleanUrl = url.trim().split("\n")[0];
-      }
+    const m = url.match(/https?:\/\/product\.kyobobook\.co\.kr\/detail\/[A-Za-z0-9_-]+/i);
+    if (m) cleanUrl = m[0];
+    else {
+      const code = url.match(/S[0-9]{12}|[0-9]{13}/);
+      cleanUrl = code
+        ? `https://product.kyobobook.co.kr/detail/${code[0]}`
+        : url.trim().split("\n")[0];
     }
   }
-
   if (!cleanUrl || !cleanUrl.startsWith("http")) {
-    cleanUrl = `https://product.kyobobook.co.kr/detail/${cleanUrl.replace(/^\//, '')}`;
+    cleanUrl = `https://product.kyobobook.co.kr/detail/${String(cleanUrl).replace(/^\//, "")}`;
   }
+  log("대상:", cleanUrl);
 
-  let response;
-  try {
-    response = await request({ url: cleanUrl });
-  } catch (e) {
-    console.log("에러 발생 - request", e);
-    alert(`도서 상세 정보를 가져오는 중 에러가 발생했습니다.\nURL: ${cleanUrl}\nError: ${e}`);
+  // ---------- 2. 상세 HTML ----------
+  const response = await fetchText(cleanUrl, {
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9",
+  });
+  if (!response) {
+    alert(`도서 상세 정보를 가져오지 못했습니다.\nURL: ${cleanUrl}`);
     return "";
   }
+  log("HTML 길이:", response.length);
 
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(response, "text/html");
-
-  const getMeta = (selector) => {
-    const el = doc.querySelector(selector);
+  const doc = new DOMParser().parseFromString(response, "text/html");
+  const getMeta = (sel) => {
+    const el = doc.querySelector(sel);
     return el ? (el.getAttribute("content") || "").trim() : "";
   };
-
-  const getText = (selector) => {
-    const el = doc.querySelector(selector);
-    return el ? el.innerText.trim() : "";
+  const getText = (sel) => {
+    const el = doc.querySelector(sel);
+    return el ? el.textContent.trim() : "";
   };
 
-  // 2. 저자 정밀 수집 (번역가 오차 방지)
-  let authors = [];
+  const coverImg =
+    getMeta('meta[property="og:image"]') || getMeta('meta[name="twitter:image"]') || "";
 
-  // (1단계) JSON-LD 데이터 (표준 원작자 데이터)
-  try {
-    const jsonLdScripts = doc.querySelectorAll('script[type="application/ld+json"]');
-    jsonLdScripts.forEach((script) => {
-      try {
-        const data = JSON.parse(script.textContent);
-        const bookData = Array.isArray(data) ? data.find(item => item["@type"] === "Book") : (data["@type"] === "Book" ? data : null);
-        if (bookData && bookData.author) {
-          let authorArr = Array.isArray(bookData.author) ? bookData.author : [bookData.author];
-          authorArr.forEach(a => {
-            let name = typeof a === "object" ? a.name : a;
-            if (name && typeof name === "string") {
-              name = name.trim();
-              if (name && !authors.includes(name)) authors.push(name);
-            }
-          });
-        }
-      } catch(err) {}
-    });
-  } catch (e) {}
+  // 표지 URL 안에 ISBN 이 있다: .../pdt/9788934972464.jpg?t=...
+  let isbn = (coverImg.match(/\/(\d{13})\./) || [])[1] || "";
+  if (!isbn) isbn = (response.match(/(\d{13})\.jpg/) || [])[1] || "";
 
-  // (2단계) 교보문고 JSON 키 정규식 탐색 (autrNm, autrName, wrtNm, artNm 등)
-  if (authors.length === 0) {
-    const authorRegexes = [
-      /"autrNm"\s*:\s*"([^"]+)"/g,
-      /"autrName"\s*:\s*"([^"]+)"/g,
-      /"wrtNm"\s*:\s*"([^"]+)"/g,
-      /"artNm"\s*:\s*"([^"]+)"/g,
-      /"chrrName"\s*:\s*"([^"]+)"/g,
-      /"personNm"\s*:\s*"([^"]+)"/g
-    ];
+  let title =
+    (getMeta('meta[property="og:image:alt"]') || "").trim() ||
+    getMeta('meta[property="og:title"]')
+      .split("|")[0]
+      .replace(/\s*-\s*교보(문고|ebook).*/i, "")
+      .trim() ||
+    "제목 없음";
 
-    authorRegexes.forEach(re => {
-      let matches = [...response.matchAll(re)];
-      matches.forEach(m => {
-        if (m[1]) {
-          let name = m[1].replace(/\\"/g, '"').trim();
-          if (name && !authors.includes(name) && name.length < 50 && !/옮긴이|번역|역자|감수/.test(name)) {
-            authors.push(name);
-          }
-        }
-      });
-    });
+  log("제목:", title, "/ ISBN:", isbn || "(못 찾음)");
+
+  // ---------- 3. 검색 API 로 저자·출판사·카테고리 ----------
+  let info = null;
+  if (isbn) info = await lookupBySearchApi(isbn);
+  if ((!info || !info.authors.length) && title && title !== "제목 없음") {
+    log("ISBN 조회 실패/저자 없음 -> 제목으로 재시도");
+    const byTitle = await lookupBySearchApi(title);
+    if (byTitle && byTitle.authors.length) info = byTitle;
   }
 
-  // (3단계) DOM 요소 탐색
-  if (authors.length === 0) {
-    let authorEls = doc.querySelectorAll(".author_sub .author_name, .prod_author_box .author, .author_name, .prod_author a, .author_list .name");
-    authorEls.forEach((el) => {
-      let name = el.innerText.trim();
-      
-      // 바로 옆 텍스트나 본인 태그에 '옮긴이', '역자' 표기가 있는지 확인
-      let isTrans = false;
-      let nextText = el.nextSibling ? el.nextSibling.textContent : "";
-      let prevText = el.previousSibling ? el.previousSibling.textContent : "";
-      
-      if (/옮긴이|역자|번역|감수/.test(name) || /옮긴이|역자|번역|감수/.test(nextText) || /옮긴이|역자|번역|감수/.test(prevText)) {
-        isTrans = true;
-      }
+  let authors = info ? info.authors.slice() : [];
+  if (!authors.length && authorHint) authors = splitAuthors(authorHint);
 
-      name = name.replace(/\((지은이|글|그림|저|원작)\)/g, "").trim();
-
-      if (name && !isTrans && !authors.includes(name) && name.length < 50 && !/옮긴이|번역|역자|감수/.test(name)) {
-        authors.push(name);
-      }
-    });
+  if (!authors.length && DEBUG) {
+    console.log("=== 저자 수집 실패 ===");
+    console.log("isbn:", isbn, "/ title:", title, "/ info:", info);
   }
 
-  // (4단계) og:title 파싱 (최후의 보루)
-  let rawTitle = getMeta('meta[property="og:title"]') || getText(".prod_title") || "제목 없음";
-  let title = rawTitle;
-  let extractedAuthorFromTitle = "";
+  const publisher = info?.publisher || "";
+  if (info?.title) title = info.title;
 
-  if (rawTitle.includes("|")) {
-    let parts = rawTitle.split("|");
-    title = parts[0].trim();
-    if (parts[1]) {
-      extractedAuthorFromTitle = parts[1].replace(/\s*-\s*교보문고.*/, "").trim();
-    }
-  } else if (rawTitle.includes(" - ")) {
-    let parts = rawTitle.split(" - ");
-    title = parts[0].trim();
-    if (parts.length >= 3 && parts[1].trim() !== "교보문고") {
-      extractedAuthorFromTitle = parts[1].trim();
-    }
-  } else {
-    title = rawTitle.replace(/\s*-\s*교보문고.*/, "").trim();
-  }
-
-  if (authors.length === 0) {
-    if (extractedAuthorFromTitle && !/옮긴이|번역|역자|감수/.test(extractedAuthorFromTitle)) {
-      authors = [extractedAuthorFromTitle];
-    } else {
-      let authorMeta = getMeta('meta[name="author"]') || getMeta('meta[property="og:author"]');
-      if (authorMeta && !/옮긴이|번역|역자|감수/.test(authorMeta)) {
-        authors = [authorMeta.trim()];
-      }
-    }
-  }
-
-  // 3. 출간일 (Publish Date) 수집
+  // ---------- 4. 출간일 ----------
   let publishDate = "";
-  let dateEl = doc.querySelector(".prod_publish .date, .publish_date, .date");
-  if (dateEl) {
-    publishDate = dateEl.innerText.trim();
-  }
-  if (!publishDate) {
-    let dateMatch = response.match(/\d{4}년\s*\d{1,2}월\s*\d{1,2}일/) || response.match(/\d{4}\.\d{2}\.\d{2}/);
-    if (dateMatch) publishDate = dateMatch[0];
+  const dm =
+    response.match(/\d{4}년\s*\d{1,2}월\s*\d{1,2}일/) || response.match(/\d{4}\.\d{2}\.\d{2}/);
+  if (dm) publishDate = dm[0];
+  if (!publishDate && info?.year) {
+    publishDate = info.month ? `${info.year}년 ${info.month}월` : info.year;
   }
 
-  // 4. 대표 카테고리 수집 (상위 2번째 대분류)
-  let category = "";
-  const ignoreCategories = ["국내도서", "외국도서", "eBook", "홈", "전체", "도서", ""];
-  let catElements = Array.from(
-    doc.querySelectorAll(".btn_sub_category, .btn_category, .category_list .category_item, .breadcrumb_item, a[href*='/category/']")
-  );
-  let validCategories = catElements
-    .map((el) => el.innerText.replace(/^>\s*/, "").trim())
-    .filter((txt) => txt && !ignoreCategories.includes(txt));
-
-  let uniqueCategories = [];
-  validCategories.forEach((c) => {
-    if (!uniqueCategories.includes(c)) uniqueCategories.push(c);
-  });
-
-  if (uniqueCategories.length > 0) {
-    category = uniqueCategories[0];
-  }
+  // ---------- 5. 카테고리 ----------
+  let category = info?.category || "";
   if (!category) {
-    category = getMeta('meta[property="article:section"]') || "독서";
+    const ignore = ["국내도서", "외국도서", "eBook", "홈", "전체", "도서", ""];
+    const cats = Array.from(
+      doc.querySelectorAll(".btn_sub_category, .btn_category, .breadcrumb_item, a[href*='/category/']")
+    )
+      .map((el) => el.textContent.replace(/^>\s*/, "").trim())
+      .filter((t) => t && !ignore.includes(t));
+    category = cats[0] || "독서";
   }
 
-  // 5. 커버 이미지, 페이지 수, 목차 수집
-  let coverImg = getMeta('meta[property="og:image"]') || getMeta('meta[name="twitter:image"]') || "";
-
+  // ---------- 6. 쪽수 / 목차 ----------
+  // 쪽수는 상세 HTML 에도 검색 API 에도 없다. 잡히면 줍고, 없으면 비워둔다.
   let pages = "";
-  let pageMatch = response.match(/(\d+)\s*쪽/);
-  if (pageMatch) {
-    pages = `${pageMatch[1]}쪽`;
-  } else {
-    pages = getText(".page_num") || "";
-  }
+  const pm = response.match(/(\d{2,4})\s*쪽/);
+  if (pm) pages = `${pm[1]}쪽`;
 
-  let toc = getText("#contents_02 .product_detail_area") || getText(".toc") || "";
+  const toc = getText("#contents_02 .product_detail_area") || getText(".toc") || "";
 
-  // 6. 날짜 계산 (YYYY-MM-DD)
+  // ---------- 7. 출력 ----------
   const today = new Date().toISOString().split("T")[0];
-  let startDate = status === "읽고 싶은 책" ? "" : today;
-  let endDate = status === "완독" ? today : "";
+  const startDate = status === "읽고 싶은 책" ? "" : today;
+  const endDate = status === "완독" ? today : "";
+  const categoryTag = (category || "독서").replace(/[\s\/]/g, "");
 
-  let categoryTag = category.replace(/[\s\/]/g, "");
+  const authorsFormatted = authors.length
+    ? authors.map((a) => `"${a.replace(/"/g, '\\"')}"`).join(", ")
+    : `"저자 미상"`;
+  const mainAuthor = authors[0] || "";
+  const fullTitle = `(Book) ${title}${mainAuthor ? " - " + mainAuthor : ""}`;
 
-  let authorsFormatted =
-    authors.length > 0
-      ? authors.map((a) => `"${a.replace(/"/g, '\\"')}"`).join(", ")
-      : `"저자 미상"`;
-
-  let mainAuthor = authors.length > 0 ? authors[0] : "";
-  let fullTitle = `(Book) ${title}${mainAuthor ? " - " + mainAuthor : ""}`;
+  log("최종:", { authors, publisher, category, publishDate, pages, isbn });
 
   try {
     await tp.file.rename(title.replace(/[\\/:*?"<>|]/g, ""));
   } catch (err) {
-    console.log("파일명 변경 패스", err);
+    log("파일명 변경 패스", err);
   }
 
-  // 7. 최종 속성 출력
-  let result = `---
+  return `---
 date create: ${today}
 tags:
   - book
   - ${categoryTag}
 book title: "${title.replace(/"/g, '\\"')}"
 authors: [${authorsFormatted}]
+publisher: "${publisher}"
 status: "${status}"
 start date: ${startDate}
 end date: ${endDate}
@@ -232,6 +237,7 @@ cover: "${coverImg}"
 category: "${category}"
 publish date: "${publishDate}"
 pages: "${pages}"
+isbn: "${isbn}"
 title: "${fullTitle}"
 aliases:
   - "${fullTitle}"
@@ -250,8 +256,6 @@ url: "${cleanUrl}"
 
 ${toc ? `## 📝 목차\n${toc}` : ""}
 `;
-
-  return result;
 }
 
 module.exports = get_kyobobook_info;
