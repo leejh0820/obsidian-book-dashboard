@@ -1,4 +1,4 @@
-# 📚 Obsidian Kyobo Book Scraper & Dashboard
+# 📚 Obsidian Book Scraper & Dashboard
 
 교보문고에서 도서 정보를 검색하여 메타데이터와 목차를 자동으로 수집하고, 독서 상태별로 대시보드 및 카드로 관리할 수 있는 옵시디언(Obsidian) 워크플로우입니다.
 
